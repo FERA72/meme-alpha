@@ -1,0 +1,27 @@
+﻿from __future__ import annotations
+import sys
+
+from config import Config
+from db_util import db_cursor
+
+
+def main() -> int:
+    print("[db_check] Trying to connect with:")
+    print(
+        f"  host={Config.DB_HOST} port={Config.DB_PORT} db={Config.DB_NAME} user={Config.DB_USER}"
+    )
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT version();")
+            row = cur.fetchone()
+        print("[db_check] OK ✅")
+        print(f"PostgreSQL: {row['version']}")
+        return 0
+    except Exception as e:
+        print("[db_check] FAILED ❌")
+        print(repr(e))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
