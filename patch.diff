@@ -1,59 +1,142 @@
-diff --git a/.env.example b/.env.example
+diff --git a/config.py b/config.py
 new file mode 100644
-index 0000000..b8c8e8b
+index 0000000..7b0e6f0
 --- /dev/null
-+++ b/.env.example
-@@ -0,0 +1,14 @@
-+# Copy this file to .env and fill real values locally.
-+# NEVER commit .env with secrets.
++++ b/config.py
+@@ -0,0 +1,67 @@
++from __future__ import annotations
++import os
++from pathlib import Path
++from typing import Optional
 +
-+DB_HOST=localhost
-+DB_PORT=5432
-+DB_NAME=meme_alpha
-+DB_USER=postgres
-+DB_PASSWORD=changeme
++from dotenv import load_dotenv
 +
-+# APIs
-+DEXSCREENER_API_KEY=
-+HELIUS_API_KEY=
++# Load .env once, from project root
++_ROOT = Path(__file__).resolve().parent
++_ENV_PATH = _ROOT / ".env"
++if _ENV_PATH.exists():
++    load_dotenv(_ENV_PATH)
++else:
++    # Fallback to any parent-provided env (CI, shell, etc.)
++    load_dotenv()
 +
-+PYTHONUNBUFFERED=1
-diff --git a/README.md b/README.md
++
++class Config:
++    """Centralized access to environment variables with defaults & type casting."""
++
++    @staticmethod
++    def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
++        val = os.getenv(name, default)
++        if required and (val is None or val == ""):
++            raise RuntimeError(f"Missing required environment variable: {name}")
++        return val
++
++    # --- Database ---
++    DB_HOST = env.__func__("DB_HOST", "localhost")
++    DB_PORT = int(env.__func__("DB_PORT", "5432"))
++    DB_NAME = env.__func__("DB_NAME", "meme_alpha")
++    DB_USER = env.__func__("DB_USER", "postgres")
++    DB_PASSWORD = env.__func__("DB_PASSWORD", "")
++
++    # --- APIs ---
++    DEXSCREENER_API_KEY = env.__func__("DEXSCREENER_API_KEY", "")
++    HELIUS_API_KEY = env.__func__("HELIUS_API_KEY", "")
++
++    # --- App ---
++    LOG_LEVEL = env.__func__("LOG_LEVEL", "INFO")
++
++
++# Convenience function
++def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
++    return Config.env(name, default, required)
+diff --git a/db_util.py b/db_util.py
 new file mode 100644
-index 0000000..a7d3c2a
+index 0000000..3b5d1b1
 --- /dev/null
-+++ b/README.md
-@@ -0,0 +1,33 @@
-+# meme-alpha
++++ b/db_util.py
+@@ -0,0 +1,84 @@
++from __future__ import annotations
++import contextlib
++import psycopg2
++from psycopg2.extras import RealDictCursor
 +
-+Pair-programming workflow with patches.
++from config import Config
 +
-+## Setup
-+1. Create a virtualenv (optional) and install deps:
-+   ```bash
-+   pip install -r requirements.txt
-+   ```
-+2. Create your local `.env` from the template:
-+   ```bash
-+   copy .env.example .env
-+   ```
-+   > Fill in real values. `.env` is gitignored.
 +
-+## Patch workflow
-+When requesting a change, assistant will send a unified diff. Apply it with:
-+```bash
-+git apply patch.diff
-+```
-+If you ever see conflicts:
-+```bash
-+git apply --reject patch.diff
-+```
++def connect():
++    """Return a new psycopg2 connection using env config."""
++    return psycopg2.connect(
++        host=Config.DB_HOST,
++        port=Config.DB_PORT,
++        dbname=Config.DB_NAME,
++        user=Config.DB_USER,
++        password=Config.DB_PASSWORD,
++        cursor_factory=RealDictCursor,
++    )
 +
-+## Common commands
-+```bash
-+git status
-+git add .
-+git commit -m "message"
-+git push
-+```
++
++@contextlib.contextmanager
++def db_cursor(autocommit: bool = False):
++    """
++    Context manager yielding a cursor.
++    Usage:
++        with db_cursor() as cur:
++            cur.execute("SELECT 1")
++            row = cur.fetchone()
++    """
++    conn = connect()
++    try:
++        conn.autocommit = autocommit
++        with conn.cursor() as cur:
++            yield cur
++            if not autocommit:
++                conn.commit()
++    except Exception:
++        # Rollback on error if we were managing transactions
++        if not autocommit:
++            conn.rollback()
++        raise
++    finally:
++        conn.close()
+diff --git a/scripts/db_check.py b/scripts/db_check.py
+new file mode 100644
+index 0000000..b7a8f8f
+--- /dev/null
++++ b/scripts/db_check.py
+@@ -0,0 +1,48 @@
++from __future__ import annotations
++import sys
++
++from config import Config
++from db_util import db_cursor
++
++
++def main() -> int:
++    print("[db_check] Trying to connect with:")
++    print(
++        f"  host={Config.DB_HOST} port={Config.DB_PORT} db={Config.DB_NAME} user={Config.DB_USER}"
++    )
++    try:
++        with db_cursor() as cur:
++            cur.execute("SELECT version();")
++            row = cur.fetchone()
++        print("[db_check] OK ✅")
++        print(f"PostgreSQL: {row['version']}")
++        return 0
++    except Exception as e:
++        print("[db_check] FAILED ❌")
++        print(repr(e))
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/requirements.txt b/requirements.txt
+index 5e5b6d1..2c5d7d1 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,0 +1,4 @@
++# Ensures local env loading & Windows-friendly psycopg2 wheels
++python-dotenv>=1.0.1
++psycopg2-binary>=2.9.9
 +
