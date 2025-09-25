@@ -1,0 +1,59 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..b8c8e8b
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,14 @@
++# Copy this file to .env and fill real values locally.
++# NEVER commit .env with secrets.
++
++DB_HOST=localhost
++DB_PORT=5432
++DB_NAME=meme_alpha
++DB_USER=postgres
++DB_PASSWORD=changeme
++
++# APIs
++DEXSCREENER_API_KEY=
++HELIUS_API_KEY=
++
++PYTHONUNBUFFERED=1
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..a7d3c2a
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,33 @@
++# meme-alpha
++
++Pair-programming workflow with patches.
++
++## Setup
++1. Create a virtualenv (optional) and install deps:
++   ```bash
++   pip install -r requirements.txt
++   ```
++2. Create your local `.env` from the template:
++   ```bash
++   copy .env.example .env
++   ```
++   > Fill in real values. `.env` is gitignored.
++
++## Patch workflow
++When requesting a change, assistant will send a unified diff. Apply it with:
++```bash
++git apply patch.diff
++```
++If you ever see conflicts:
++```bash
++git apply --reject patch.diff
++```
++
++## Common commands
++```bash
++git status
++git add .
++git commit -m "message"
++git push
++```
++
