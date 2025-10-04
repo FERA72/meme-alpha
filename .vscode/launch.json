@@ -1,0 +1,50 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run FreshBot (runner.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/runner.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Serve Bot Candles (scripts/serve_chart.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/serve_chart.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Scan Recent (instant posts)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scripts.scan_recent",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "args": [
+                "--limit",
+                "200",
+                "--min-liq",
+                "500",
+                "--min-mcap",
+                "0",
+                "--min-score",
+                "0",
+                "--max-age",
+                "999",
+                "--max-posts",
+                "3",
+                "--verbose"
+            ]
+        }
+    ]
+}
