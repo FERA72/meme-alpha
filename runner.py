@@ -1,4 +1,4 @@
-# runner.py — one-command mode (spawns chart server)
+# runner.py — scan → score → post; one-command mode: auto chart + auto AI signal loops
 import os
 import sys
 import time
@@ -63,6 +63,8 @@ def _passes_filters(mk: dict, age_min: float):
         reasons.append("fdv/liq")
     return (len(reasons) == 0), reasons
 
+# ---------------- one-command bits ----------------
+
 
 def ensure_chart_server():
     try:
@@ -72,7 +74,6 @@ def ensure_chart_server():
             return
     except Exception:
         pass
-
     print("[Chart] starting local chart server...")
     script_path = os.path.join(os.path.dirname(
         __file__), "scripts", "serve_chart.py")
@@ -81,7 +82,6 @@ def ensure_chart_server():
     logf = open("chart.log", "a", buffering=1)
     subprocess.Popen([sys.executable, script_path],
                      stdout=logf, stderr=subprocess.STDOUT)
-
     for _ in range(20):
         try:
             r = requests.get(f"{CFG.CHART_BASE_URL}/health", timeout=1)
@@ -93,72 +93,31 @@ def ensure_chart_server():
     print("[Chart] WARN: chart not reachable at", CFG.CHART_BASE_URL)
 
 
-def helius_loop():
-    print("[Helius] loop started.")
-    while True:
-        try:
-            sigs = helius.get_recent_signatures(limit=60)
-            total = kept_age = kept_liq = kept_score = posted = 0
-            for s in sigs:
-                sig = s["signature"]
-                if store.is_seen(sig):
-                    continue
-                store.mark_seen(sig)
-                tx = helius.get_tx(sig)
-                tx_ts = datetime.fromtimestamp(
-                    tx.get("blockTime", 0), tz=timezone.utc)
-
-                for mint in mints_from_tx(tx):
-                    total += 1
-                    mk = mkt.fetch_market(mint)
-                    if not mk:
-                        continue
-
-                    ds_age = mk["age_min"]
-                    tx_age = minutes_ago(tx_ts)
-                    age_eff = tx_age if ds_age is None else min(ds_age, tx_age)
-                    if age_eff > MAX_AGE_MIN:
-                        continue
-                    kept_age += 1
-
-                    ok, _ = _passes_filters(mk, age_eff)
-                    if not ok:
-                        continue
-                    kept_liq += 1
-
-                    sc, parts = scoring.score(mk)
-                    if sc < MIN_SCORE:
-                        continue
-                    kept_score += 1
-
-                    ok_bump, last = store.should_post(
-                        mk["mint"], sc, SCORE_REPOST_BUMP)
-                    if not ok_bump:
-                        continue
-
-                    sid = analytics.record_signal(mk, sc, parts)
-                    notifier.post(mk, sc, {
-                                  "liq": parts["liq"], "mc": parts["mc"], "age": parts["age"], "ratio": parts["ratio"]})
-                    store.mark_posted(mk["mint"], sc)
-                    track_once(mk["mint"])
-                    print(
-                        f"[POSTED] {mk['symbol']} score={sc} liq=${int(mk['liq_usd']):,} age={age_eff:.1f}m (last={last}) sid={sid}")
-                    posted += 1
-
-            print(
-                f"[tick] sigs={len(sigs)} seen={total} fresh={kept_age} liq_ok={kept_liq} score≥{MIN_SCORE}={kept_score} posted={posted}")
-        except requests.exceptions.ReadTimeout:
-            print("[Helius] timeout; retrying next tick")
-        except Exception as e:
-            print("[Helius] error:", repr(e))
-        time.sleep(CFG.POLL_SECONDS)
+# auto-spawn AI loops per posted mint (runs scripts.signal_loop as a module)
+ACTIVE_LOOPS = {}   # mint -> (Popen, start_ts)
+LOOP_TTL_SEC = 30*60  # keep each loop 30 minutes
 
 
-def main():
-    print("[Runner] FreshBot started.")
-    ensure_chart_server()
-    helius_loop()
+def prune_loops():
+    now = time.time()
+    dead = []
+    for mint, (proc, t0) in ACTIVE_LOOPS.items():
+        if (proc.poll() is not None) or (now - t0 > LOOP_TTL_SEC):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+            dead.append(mint)
+    for m in dead:
+        ACTIVE_LOOPS.pop(m, None)
 
 
-if __name__ == "__main__":
-    main()
+def spawn_signal_loop(mint: str):
+    prune_loops()
+    if mint in ACTIVE_LOOPS:
+        return
+    proj_root = os.path.dirname(os.path.abspath(__file__))
+    env = dict(os.environ)
+    # ensure PYTHONPATH set for the child to import core.*
+    env.s

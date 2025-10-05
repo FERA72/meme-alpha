@@ -1,222 +1,258 @@
-# scripts/serve_chart.py  — Real-time candlestick viewer with B/S markers
-# Run:  python scripts/serve_chart.py  → http://localhost:8765/?mint=<MINT>
-import json
-import time
+# scripts/serve_chart.py
 import requests
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os
+import sqlite3
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-DEX_TOKENS_V1 = "https://api.dexscreener.com/tokens/v1/{chainId}/{tokenAddresses}"
+PORT = 8765
+DB_PATH = "freshbot.sqlite3"
 
-HTML = """<!doctype html><html><head>
-<meta charset="utf-8"/><title>Bot Chart (Candles, Live)</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<link rel="preconnect" href="https://cdn.jsdelivr.net">
-<style>
-  :root{--bg:#0b0f14;--panel:#0f141b;--text:#e6edf3;--muted:#9fb5c6;--accent:#19c37d;--red:#ff6b6b;--grid:#13202c}
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
-  .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
-  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-  .pill{background:#0e1b24;border:1px solid #183041;color:#b9d3e4;padding:4px 8px;border-radius:999px;font-size:12px}
-  .card{background:var(--panel);border:1px solid #14212c;border-radius:14px;padding:12px}
-  h1{font-size:18px;margin:0}
-  a{color:#7cc6ff;text-decoration:none}
-  #chart{height:60vh}
-  .legend{font-size:12px;color:var(--muted);margin-top:8px}
-  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  .spacer{flex:1}
-  select{background:#0f1a23;border:1px solid #1b3241;color:#c7d6e2;padding:6px 8px;border-radius:8px}
-</style>
-</head><body>
-<div class="wrap">
-  <header class="row">
-    <h1>Bot Candles <span id="sym" class="pill"></span></h1>
-    <span id="mintPill" class="pill"></span>
-    <a id="pair" class="pill" target="_blank" rel="noopener">Open pair ↗</a>
-    <span id="status" class="pill">connecting…</span>
-    <div class="spacer"></div>
-    <label>Timeframe</label>
-    <select id="tf">
-      <option value="5000">5s</option>
-      <option value="15000">15s</option>
-      <option value="60000" selected>1m</option>
-      <option value="300000">5m</option>
-    </select>
-  </header>
-
-  <div class="card">
-    <div id="chart"><canvas id="c"></canvas></div>
-    <div class="legend">B/S markers from a simple EMA cross + momentum + DD stop. Viz only.</div>
+HTML = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Mint viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    html,body,#wrap {{ height:100%; margin:0; background:#0b1220; color:#e6edf3; font-family:ui-sans-serif,system-ui }}
+    #hdr {{ padding:10px 14px; border-bottom:1px solid #1e2636; display:flex; gap:10px; align-items:center }}
+    #sym {{ font-weight:600 }}
+    #chart {{ height: calc(100% - 52px); }}
+    a {{ color:#8ab4ff; text-decoration:none }}
+    .tag {{ background:#1b2233; padding:4px 8px; border-radius:8px; font-size:12px }}
+  </style>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div id="wrap">
+    <div id="hdr">
+      <div id="sym"></div>
+      <span class="tag" id="mint"></span>
+      <a id="dslink" class="tag" target="_blank" rel="noreferrer">Dex page</a>
+      <span class="tag" id="status">loading…</span>
+    </div>
+    <div id="chart"></div>
   </div>
-</div>
+  <script>
+    const qs = new URLSearchParams(location.search);
+    const MINT = qs.get('mint') || '';
+    document.getElementById('mint').textContent = MINT || 'unknown';
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@3.3.0/dist/chartjs-chart-financial.min.js"></script>
-<script>
-const q = new URLSearchParams(location.search);
-const mint = q.get("mint") || "";
-document.getElementById('mintPill').textContent = mint ? (mint.slice(0,6)+"…"+mint.slice(-4)) : '';
-let meta = {symbol:null, pair_url:null};
-let samples = []; // {t, price}
-let candles = []; // {t,o,h,l,c}
-let bs = [];      // {x,y,type:'BUY'|'SELL'}
-let entry = null;
-let tfMs = 60000;
+    const chart = LightweightCharts.createChart(document.getElementById('chart'), {{
+      layout: {{ background: {{ type:'solid', color:'#0b1220' }}, textColor:'#e6edf3' }},
+      grid: {{ vertLines: {{ color:'#1e2636' }}, horzLines: {{ color:'#1e2636' }} }},
+      timeScale: {{ rightOffset: 2, secondsVisible: true }},
+      crosshair: {{ mode: 0 }}
+    }});
+    const candleSeries = chart.addCandlestickSeries();
+    const buyMarkers = []; const sellMarkers = [];
 
-function ema(values, period){ const k=2/(period+1); let out=[],prev=values[0]??0;
-  for(let i=0;i<values.length;i++){ const v=values[i]; prev=i===0?v:(v-prev)*k+prev; out.push(prev);} return out; }
-function pct(a,b){ if(!b) return 0; return (a-b)/b*100; }
+    function setStatus(t) {{ document.getElementById('status').textContent = t }}
 
-function strategyOnClose(){
-  if(candles.length < 25) return;
-  const closes = candles.map(c=>c.c);
-  const ema8 = ema(closes,8), ema21 = ema(closes,21);
-  const i = closes.length-1;
-  const mom8 = pct(closes[i], closes[Math.max(0,i-8)]);
-  const dd = entry ? pct(closes[i], entry.price) : 0;
-  const crossUp = ema8[i] > ema21[i] && ema8[i-1] <= ema21[i-1];
-  if(!entry && crossUp && mom8 > 1.5){
-    entry = {idx:i, price:closes[i]};
-    bs.push({x:candles[i].t, y:closes[i], type:'BUY'});
-    return;
-  }
-  const crossDn = ema8[i] < ema21[i] && ema8[i-1] >= ema21[i-1];
-  if(entry && (dd < -12 || crossDn || mom8 < -1)){
-    bs.push({x:candles[i].t, y:closes[i], type:'SELL'});
-    entry = null;
-  }
-}
+    async function fetchDexCandles(mint) {{
+      // Use DexScreener's public token endpoint to find a liquid pair, then fetch chart data via proxy /candles
+      // We read through the server to avoid CORS headaches; the server exposes /candles for us.
+      const r = await fetch('/candles?mint=' + encodeURIComponent(mint));
+      if (!r.ok) throw new Error('candle fetch failed');
+      return await r.json(); // {{ candles:[{{time,open,high,low,close}}], symbol, pairUrl }}
+    }}
 
-function rebuildCandles(){
-  if(!samples.length) return;
-  const tf = tfMs;
-  const firstBucket = Math.floor(samples[0].t/tf)*tf;
-  let bucketStart = firstBucket, i=0, out=[];
-  while(i < samples.length){
-    let o=null,h=-Infinity,l=Infinity,c=null,ts=bucketStart;
-    while(i<samples.length && Math.floor(samples[i].t/tf)*tf===bucketStart){
-      const p=samples[i].price; if(o===null) o=p; h=Math.max(h,p); l=Math.min(l,p); c=p; i++;
-    }
-    if(o===null){ bucketStart += tf; continue; }
-    out.push({t:ts,o,h,l,c}); bucketStart += tf;
-  }
-  candles = out.slice(-720);
-  strategyOnClose();
-  render();
-}
+    async function fetchServerSignals(mint) {{
+      const r = await fetch('/api/live?mint=' + encodeURIComponent(mint));
+      if (!r.ok) return {{ signals: [] }};
+      return await r.json();
+    }}
 
-async function poll(){
-  if(!mint) return;
-  try{
-    const r = await fetch('/api/live?mint='+encodeURIComponent(mint));
-    const j = await r.json();
-    if(j.error) throw new Error(j.error);
-    if(!meta.symbol && j.symbol){ meta.symbol=j.symbol; document.getElementById('sym').textContent=j.symbol||'—'; }
-    if(!meta.pair_url && j.pair_url){ meta.pair_url=j.pair_url; const p=document.getElementById('pair'); p.href=j.pair_url; }
-    const t=j.ts, price=parseFloat(j.priceUsd);
-    if(Number.isFinite(price)){
-      samples.push({t,price});
-      const cutoff=t-(6*60*60*1000); while(samples.length && samples[0].t<cutoff) samples.shift();
-      rebuildCandles();
-    }
-    document.getElementById('status').textContent = 'live @ '+new Date(t).toLocaleTimeString();
-  }catch(e){
-    document.getElementById('status').textContent='disconnected';
-  }
-}
+    function drawMarkersFromServer(sigs) {{
+      const m = [];
+      for (const s of sigs) {{
+        const time = Math.floor(new Date(s.t).getTime() / 1000);
+        const text = s.side === 'B' ? 'B' : 'S';
+        const color = s.side === 'B' ? '#00e676' : '#ff6e6e';
+        m.push({{ time, position: s.side === 'B' ? 'belowBar' : 'aboveBar', shape:'circle', color, text, size:1 }});
+      }}
+      candleSeries.setMarkers(m);
+    }}
 
-let chart;
-function render(){
-  if(!chart){
-    const ctx=document.getElementById('c').getContext('2d');
-    chart = new Chart(ctx,{type:'candlestick',data:{datasets:[
-      {label:'Price (USD)',data:candles.map(c=>({x:c.t,o:c.o,h:c.h,l:c.l,c:c.c})),yAxisID:'y'},
-      {label:'Signals',type:'scatter',data:bs,parsing:false,yAxisID:'y',
-       pointRadius:5,pointBackgroundColor:(ctx)=>ctx.raw?.type==='BUY'?'#19c37d':'#ff6b6b',pointBorderColor:'#0b0f14'}
-    ]},options:{animation:false,maintainAspectRatio:false,
-      scales:{x:{type:'time',grid:{color:'var(--grid)'},ticks:{color:'#86a3b6'}},
-              y:{position:'left',grid:{color:'var(--grid)'},ticks:{color:'#b4d0e5'}}},
-      plugins:{legend:{labels:{color:'#b4d0e5'}}}}); }
-  else{
-    chart.data.datasets[0].data = candles.map(c=>({x:c.t,o:c.o,h:c.h,l:c.l,c:c.c}));
-    chart.data.datasets[1].data = bs; chart.update();
-  }
-}
+    async function bootstrap() {{
+      if (!MINT) {{ setStatus('no mint'); return; }}
+      try {{
+        const boot = await fetchDexCandles(MINT);
+        document.getElementById('sym').textContent = boot.symbol || 'Pair';
+        document.getElementById('dslink').href = boot.pairUrl || '#';
+        candleSeries.setData(boot.candles);
+        setStatus('live');
+        refreshSignals();
+        refreshCandles();  // light refresh to extend candles
+      }} catch(e) {{
+        setStatus('error: ' + e.message);
+      }}
+    }}
 
-setInterval(poll, 3000);
-document.getElementById('tf').addEventListener('change', e=>{ tfMs=parseInt(e.target.value,10); rebuildCandles(); });
-</script></body></html>
-"""
+    async function refreshCandles() {{
+      try {{
+        const boot = await fetchDexCandles(MINT);
+        candleSeries.setData(boot.candles);
+      }} catch(e) {{}}
+      setTimeout(refreshCandles, 8000);
+    }}
+
+    async function refreshSignals() {{
+      try {{
+        const j = await fetchServerSignals(MINT);
+        drawMarkersFromServer(j.signals || []);
+      }} catch(e) {{}}
+      setTimeout(refreshSignals, 5000);
+    }}
+
+    bootstrap();
+  </script>
+</body>
+</html>"""
 
 
-def best_pair(pairs):
+def _conn():
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("""CREATE TABLE IF NOT EXISTS ai_trades(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mint TEXT NOT NULL,
+      ts   TEXT NOT NULL,
+      side TEXT NOT NULL CHECK(side IN ('B','S')),
+      price REAL NOT NULL,
+      conf REAL,
+      UNIQUE(mint, ts, side)
+    );""")
+    return con
+
+
+def _json(obj, code=200):
+    b = json.dumps(obj).encode()
+    return code, {"Content-Type": "application/json", "Content-Length": str(len(b))}, b
+
+
+def _html(s, code=200):
+    b = s.encode()
+    return code, {"Content-Type": "text/html", "Content-Length": str(len(b))}, b
+
+
+def _bad(msg="bad request", code=400):
+    return _json({"error": msg}, code)
+
+
+# Very small DexScreener proxy so the page can load candles without CORS pain
+
+
+def proxy_candles(mint: str):
+    # find top pair for the mint
+    j = requests.get(
+        f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=10).json()
+    pairs = (j or {}).get("pairs") or []
     if not pairs:
-        return None
-
-    def key(p):
-        liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
-        quote = (p.get("quoteToken") or {}).get("symbol", "")
-        prio = 1 if quote in ("USDC", "USDT", "USD") else 0
-        return (prio, liq)
-    return sorted(pairs, key=key, reverse=True)[0]
+        return {"candles": [], "symbol": "unknown", "pairUrl": None}
+    pair = max(pairs, key=lambda p: float(
+        p.get("liquidity", {}).get("usd", 0) or 0))
+    symbol = f"{pair.get('baseToken', {}).get('symbol', '?')}/{pair.get('quoteToken', {}).get('symbol', '?')}"
+    pair_url = pair.get("url")
+    # DexScreener bars endpoint (1m). If unavailable just synthesize from last trades.
+    # Public bars API:
+    #   https://api.dexscreener.com/chart/bars/{chain}/{pairAddress}?from=unix&to=unix&resolution=1
+    chain = pair.get("chainId") or "solana"
+    addr = pair.get("pairAddress")
+    now = int(time.time())
+    frm = now - 60*60*6   # ~6h
+    bars = requests.get(
+        f"https://api.dexscreener.com/chart/bars/{chain}/{addr}",
+        params={"from": frm, "to": now, "resolution": 1}, timeout=10
+    ).json()
+    candles = []
+    for b in (bars or []):
+        # each bar: [t, o, h, l, c, v] per docs; time is unix seconds
+        try:
+            candles.append({"time": int(b[0]), "open": float(b[1]), "high": float(b[2]),
+                            "low": float(b[3]), "close": float(b[4])})
+        except Exception:
+            continue
+    return {"candles": candles[-800:], "symbol": symbol, "pairUrl": pair_url}
 
 
 class H(BaseHTTPRequestHandler):
-    def log_message(self, *a): return
-
-    def _send(self, code, body, ctype="text/html"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
     def do_GET(self):
         try:
             u = urlparse(self.path)
-            if u.path == "/":
-                return self._send(200, HTML.encode(), "text/html")
-            if u.path == "/health":
-                return self._send(200, b"ok", "text/plain")
-            if u.path == "/api/live":
+            if u.path in ("/", "/index.html"):
+                code, headers, body = _html(HTML)
+            elif u.path == "/health":
+                code, headers, body = _html("ok")
+            elif u.path == "/api/live":
                 qs = parse_qs(u.query)
-                mint = (qs.get("mint") or [""])[0].strip()
-                chain = (qs.get("chain") or ["solana"])[
-                    0].strip().lower() or "solana"
+                mint = (qs.get("mint", [""])[0] or "").strip()
                 if not mint:
-                    return self._send(400, json.dumps({"error": "mint required"}).encode(), "application/json")
-                url = DEX_TOKENS_V1.format(chainId=chain, tokenAddresses=mint)
-                r = requests.get(url, timeout=10)
-                r.raise_for_status()
-                data = r.json()
-                pairs = data if isinstance(data, list) else data.get(
-                    "pairs") or data.get("data") or []
-                p = best_pair(pairs)
-                if not p:
-                    return self._send(404, json.dumps({"error": "pair not found"}).encode(), "application/json")
-                payload = {
-                    "chainId": p.get("chainId"),
-                    "pairAddress": p.get("pairAddress"),
-                    "dexId": p.get("dexId"),
-                    "pair_url": p.get("url"),
-                    "symbol": (p.get("baseToken") or {}).get("symbol"),
-                    "priceUsd": p.get("priceUsd"),
-                    "txns": p.get("txns", {}),
-                    "volume": p.get("volume", {}),
-                    "liquidity": p.get("liquidity", {}),
-                    "ts": int(time.time()*1000)
-                }
-                return self._send(200, json.dumps(payload).encode(), "application/json")
-            return self._send(404, b"not found", "text/plain")
+                    code, headers, body = _bad("missing mint")
+                    self._send(code, headers, body)
+                    return
+                con = _conn()
+                cur = con.cursor()
+                cur.execute(
+                    "SELECT ts, side, price, conf FROM ai_trades WHERE mint=? ORDER BY ts ASC LIMIT 500", (mint,))
+                rows = cur.fetchall()
+                con.close()
+                code, headers, body = _json({"signals": [{"t": r[0], "side": r[1], "price": float(
+                    r[2]), "conf": (r[3] if r[3] is not None else None)} for r in rows]})
+            elif u.path == "/candles":
+                qs = parse_qs(u.query)
+                mint = (qs.get("mint", [""])[0] or "").strip()
+                if not mint:
+                    code, headers, body = _bad("missing mint")
+                    self._send(code, headers, body)
+                    return
+                data = proxy_candles(mint)
+                code, headers, body = _json(data)
+            elif u.path == "/api/marker/test":
+                # quick manual test: /api/marker/test?mint=<MINT>
+                qs = parse_qs(u.query)
+                mint = (qs.get("mint", [""])[0] or "").strip()
+                if not mint:
+                    code, headers, body = _bad("missing mint")
+                    self._send(code, headers, body)
+                    return
+                ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                con = _conn()
+                con.execute("INSERT OR IGNORE INTO ai_trades(mint, ts, side, price, conf) VALUES(?,?,?,?,?)",
+                            (mint, ts, "B", 1.0, 0.66))
+                con.execute("INSERT OR IGNORE INTO ai_trades(mint, ts, side, price, conf) VALUES(?,?,?,?,?)",
+                            (mint, ts, "S", 1.0, 0.55))
+                con.commit()
+                con.close()
+                code, headers, body = _json({"ok": True})
+            else:
+                code, headers, body = _bad("not found", 404)
+            self._send(code, headers, body)
         except Exception as e:
-            return self._send(500, json.dumps({"error": repr(e)}).encode(), "application/json")
+            code, headers, body = _bad(f"server error: {e}", 500)
+            try:
+                self._send(code, headers, body)
+            except:
+                pass
+
+    def log_request(self, *args, **kwargs):
+        # keep console clean
+        pass
+
+    def _send(self, code, headers, body):
+        self.send_response(code)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
 
 
-def main(port=8765):
-    print(f"[viewer] http://localhost:{port}/?mint=<MINT>")
-    HTTPServer(("0.0.0.0", port), H).serve_forever()
+def main():
+    print(f"[viewer] http://localhost:{PORT}/?mint=<MINT>")
+    HTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
 
 if __name__ == "__main__":

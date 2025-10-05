@@ -71,3 +71,15 @@ CREATE TABLE IF NOT EXISTS hot_keywords (
   score       NUMERIC NOT NULL,     -- 0..100
   last_seen   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ===== AI trades written by your strategy / model =====
+CREATE TABLE IF NOT EXISTS ai_trades (
+  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  mint   TEXT NOT NULL,
+  ts     TEXT NOT NULL,          -- ISO8601 (UTC)
+  side   TEXT NOT NULL CHECK(side IN ('B','S')),
+  price  REAL NOT NULL,
+  conf   REAL,                   -- optional confidence 0..1
+  UNIQUE(mint, ts, side)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_trades_mint_ts ON ai_trades(mint, ts);

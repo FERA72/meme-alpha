@@ -1,46 +1,60 @@
 # core/strategy.py
-import sqlite3
-import time
-from .store import conn
+import math
+from collections import deque
+import numpy as np
+
+try:
+    from .model import model_score_proba  # optional; returns None if no model
+except Exception:
+    def model_score_proba(_df): return None
 
 
-def load_ticks(mint: str, last_n=60):
-    cur = conn().execute(
-        "SELECT * FROM ticks WHERE mint=? ORDER BY ts DESC LIMIT ?", (mint, last_n))
-    rows = list(reversed(cur.fetchall()))
-    return rows
+def ema(arr, n):
+    k = 2/(n+1)
+    out = []
+    e = None
+    for x in arr:
+        e = x if e is None else (x - e)*k + e
+        out.append(e)
+    return np.array(out)
 
 
-def pct(a, b):
-    if b == 0 or b is None:
-        return 0.0
-    return (a-b)/b*100.0
+def momentum(arr, n):
+    out = np.zeros(len(arr))
+    for i in range(n, len(arr)):
+        out[i] = arr[i] - arr[i-n]
+    return out
 
 
-def should_enter(mint: str):
-    rows = load_ticks(mint, last_n=30)
-    if len(rows) < 8:
-        return (False, "not enough ticks")
-    p_now = rows[-1]["price_usd"]
-    p_8 = rows[-8]["price_usd"]
-    mom = pct(p_now, p_8)
-    buys = rows[-1]["tx_m5_buys"]
-    sells = rows[-1]["tx_m5_sells"]
-    flow = buys - sells
-    vol_uptick = rows[-1]["vol_m5"] > max(r["vol_m5"] for r in rows[-6:-1])
-    ok = (mom > 2.0) and (flow >= 5) and vol_uptick
-    reason = f"mom={mom:.1f}% flow={flow} vol_uptick={vol_uptick}"
-    return ok, reason
+def decide_from_candles(candles, last_n=120,
+                        ema_fast=8, ema_slow=21,
+                        mom_win=8, dd_stop=0.03,
+                        proba_buy=0.62, proba_sell=0.45):
+    """
+    candles: list of dicts with keys time/open/high/low/close
+    returns: 'B'|'S'|None plus confidence float
+    """
+    if not candles or len(candles) < max(ema_fast, ema_slow, mom_win) + 2:
+        return None
 
+    closes = np.array([c["close"] for c in candles[-last_n:]], dtype=float)
+    ef = ema(closes, ema_fast)
+    es = ema(closes, ema_slow)
+    mom = momentum(closes, mom_win)
 
-def should_exit(mint: str, entry_price: float):
-    rows = load_ticks(mint, last_n=20)
-    if not rows:
-        return (False, "no ticks")
-    p_now = rows[-1]["price_usd"]
-    dd = pct(p_now, entry_price)
-    # exit if drawdown > -12% or momentum 8-tick is negative
-    p_8 = rows[-8]["price_usd"] if len(rows) >= 8 else rows[0]["price_usd"]
-    mom = pct(p_now, p_8)
-    hit = (dd < -12.0) or (mom < -1.5)
-    return hit, f"dd={dd:.1f}% mom8={mom:.1f}%"
+    b = ef[-2] <= es[-2] and ef[-1] > es[-1] and mom[-1] > 0
+    s = ef[-2] >= es[-2] and ef[-1] < es[-1] and mom[-1] < 0
+
+    # optional ML probability on top
+    p = model_score_proba(closes)  # returns float 0..1 or None
+    if p is not None:
+        if p >= proba_buy:
+            b = True
+        if p <= proba_sell:
+            s = True
+
+    if b and not s:
+        return ("B", float(0.6 if p is None else p))
+    if s and not b:
+        return ("S", float(0.6 if p is None else 1.0-p))
+    return None
